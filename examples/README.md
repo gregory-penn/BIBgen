@@ -260,3 +260,47 @@ own `tag` column — no hardcoded list to maintain) and every `history_<tag>.csv
 
 Use ``--tag-order`` to fix the tag ordering/subset shown (comma-separated); otherwise tags are
 auto-sorted from whatever's present in the data.
+
+## Conversion to EDM4hep (BIB overlay input)
+
+`conversion/convert_hdf5_to_edm4hep.py` turns ECAL barrel hits in an HDF5 file into EDM4hep files
+shaped like the ddsim BIB files (`BIB10TeV/sim_mp/BIB_sim_*.edm4hep.root`), so they can be used by
+the BIB overlay (`OverlayTimingRandomMix`) and ECAL digitization (`RealisticCaloDigiSilicon`).
+
+- **One event per file** (`<prefix>_<N>.edm4hep.root`): the overlay reads only the first event of
+  each background file.
+- **Each input hit becomes one `CaloHitContribution`**, snapped to a MAIA ECAL barrel cell.
+  Contributions in the same cell are grouped into one `SimCalorimeterHit` whose energy is their
+  sum and whose position is the cell center. The contribution keeps the unsnapped position as
+  `stepPosition`; `PDG` is 0, `stepLength` is 0 and there is no MCParticle link.
+- **Time** comes from `--time-column` if given, otherwise every time is 0. The digitizer keeps only
+  contributions with `t - |r|/c` between -0.5 and 1.0 ns, so **with time 0 no generated hit survives
+  digitization** (it does pass the overlay's own window, -0.5 < t < 15 ns).
+- **Cuts, all counted** per event in `conversion_summary.csv`: non-finite values, energy <= 0,
+  and positions outside the instrumented barrel (inside the first layer, outside the last layer,
+  beyond the half-length, or in the gaps between staves).
+- `EventHeader` and an empty `MCParticles` collection are always written. Empty collections for
+  the other subdetectors are written too (so the file has the same collections as the ddsim files
+  and the overlay prints no warnings); `--no-placeholders` leaves them out.
+- The input must be in **physical units** with feature order `(E, phi, s, z)`. Sphered generated
+  output must be un-sphered first.
+
+Snapping uses `config/maia_v0_ecal_barrel_geometry.json`, a table of the cell grid of every
+(module, layer) taken from DD4hep by `conversion/extract_ecal_geometry.py`. It reproduces the
+Geant4 cell IDs of all 476,915 ECAL barrel hits in 20 `sim_mp` files.
+
+All three scripts need the MuColl software image (podio, edm4hep, DD4hep):
+
+```bash
+IMG=/cvmfs/unpacked.cern.ch/ghcr.io/muoncollidersoft/mucoll-sim-ubuntu24:v3.1-amd64
+apptainer exec -B /scratch -B /cvmfs -B /ospool $IMG bash -c '
+  source /opt/setup_mucoll.sh && export PYTHONPATH=src:$PYTHONPATH
+  # convert (generated <tag>_like.hdf5 files have evt_N at the top level)
+  python examples/conversion/convert_hdf5_to_edm4hep.py -i generated.hdf5 -o edm4hep_out
+  # raw files keep events in a group, one dataset per event
+  python examples/conversion/convert_hdf5_to_edm4hep.py -i raw.hdf5 --group test --dataset tau0 -o edm4hep_out
+  # validate on a real ddsim file: round trip of its ECAL barrel hits through the converter
+  python examples/conversion/validate_conversion.py -i BIB_sim_1000.edm4hep.root
+  # regenerate the geometry table (only needed if the detector geometry changes)
+  python examples/conversion/extract_ecal_geometry.py'
+```
