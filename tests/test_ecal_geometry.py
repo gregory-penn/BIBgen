@@ -3,7 +3,16 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from BIBgen.ecal_geometry import ECalBarrelGeometry, SnapStatus, parse_bitfield
+from BIBgen.ecal_geometry import (
+    CELL_SIZE,
+    LAYER_THICKNESS,
+    SnapStatus,
+    cell_center,
+    decode_cell_id,
+    encode_cell_id,
+    module_axes,
+    snap,
+)
 
 # (cellID, cell-center position in mm) of real hits in a ddsim BIB file
 # (BIB10TeV/sim_mp/BIB_sim_1000.edm4hep.root). The last six are cells at the stave
@@ -23,49 +32,24 @@ REAL_HITS = [
 ]
 
 
-@pytest.fixture(scope="module")
-def geometry():
-    return ECalBarrelGeometry.from_json()
-
-
-def test_parse_bitfield():
-    fields = parse_bitfield("system:0:5,side:5:-2,module:7:8,x:32:-16,y:-16")
-    assert fields == {
-        "system": (0, 5, False),
-        "side": (5, 2, True),
-        "module": (7, 8, False),
-        "x": (32, 16, True),
-        "y": (48, 16, True),
-    }
-
-
-def test_table_matches_maia(geometry):
-    assert geometry.collection == "ECalBarrelCollection"
-    assert geometry.cell_id_encoding == (
-        "system:0:5,side:5:-2,module:7:8,stave:15:4,layer:19:9,submodule:28:4,x:32:-16,y:48:-16"
-    )
-    assert len(geometry.modules) == 12
-    assert len(geometry.layers) == 50
-    assert geometry.cell_size_x == pytest.approx(5.1)
-    assert geometry.fixed_fields["system"] == 20
-
-
-def test_real_cell_ids_are_reproduced(geometry):
+def test_real_cell_ids_are_reproduced():
     cell_ids = np.array([c for c, _ in REAL_HITS], dtype=np.uint64)
     positions = np.array([p for _, p in REAL_HITS])
-    snap = geometry.snap(positions)
-    assert np.all(snap.inside)
-    np.testing.assert_array_equal(geometry.encode_cell_id(snap.module, snap.layer, snap.x, snap.y), cell_ids)
-    centers = geometry.cell_center(snap.module, snap.layer, snap.x, snap.y)
+    snapped = snap(positions)
+    assert np.all(snapped.inside)
+    np.testing.assert_array_equal(
+        encode_cell_id(snapped.module, snapped.layer, snapped.x, snapped.y), cell_ids
+    )
+    centers = cell_center(snapped.module, snapped.layer, snapped.x, snapped.y)
     np.testing.assert_allclose(centers, positions, atol=1e-3)
 
 
-def test_encode_decode_round_trip(geometry):
+def test_encode_decode_round_trip():
     module = np.array([0, 5, 11, 7])
     layer = np.array([0, 13, 49, 25])
     x = np.array([0, -108, 97, -1])
     y = np.array([0, 452, -452, -1])
-    fields = geometry.decode_cell_id(geometry.encode_cell_id(module, layer, x, y))
+    fields = decode_cell_id(encode_cell_id(module, layer, x, y))
     np.testing.assert_array_equal(fields["module"], module)
     np.testing.assert_array_equal(fields["layer"], layer)
     np.testing.assert_array_equal(fields["x"], x)
@@ -73,32 +57,24 @@ def test_encode_decode_round_trip(geometry):
     np.testing.assert_array_equal(fields["system"], 20)
 
 
-def test_encode_rejects_out_of_range(geometry):
-    with pytest.raises(ValueError, match="out of range"):
-        geometry.encode_cell_id(0, 0, 40000, 0)
-
-
-def test_points_inside_a_cell_snap_to_it(geometry):
+def test_points_inside_a_cell_snap_to_it():
     # Cell (module 2, layer 10, x 3, y -7): move around within the cell, away from stave edges.
-    m, lay = 2, 10
-    center = geometry.cell_center(m, lay, 3, -7)
-    i = np.searchsorted(geometry.modules, m)
-    j = np.searchsorted(geometry.layers, lay)
-    pitch = geometry.layer_depth[i, j + 1] - geometry.layer_depth[i, j]
+    center = cell_center(2, 10, 3, -7)
+    normal, axis_x = module_axes(2)
     rng = np.random.default_rng(0)
     offsets = rng.uniform(-0.49, 0.49, size=(1000, 3))
     points = (
         center
-        + offsets[:, :1] * geometry.cell_size_x * geometry.axis_x[i, j]
-        + offsets[:, 1:2] * geometry.cell_size_y * geometry.axis_y[i, j]
-        + offsets[:, 2:] * pitch * geometry.normal[i, j]
+        + offsets[:, :1] * CELL_SIZE * axis_x
+        + offsets[:, 1:2] * CELL_SIZE * np.array([0.0, 0.0, 1.0])
+        + offsets[:, 2:] * LAYER_THICKNESS * normal
     )
-    snap = geometry.snap(points)
-    assert np.all(snap.inside)
-    assert np.all(snap.module == m)
-    assert np.all(snap.layer == lay)
-    assert np.all(snap.x == 3)
-    assert np.all(snap.y == -7)
+    snapped = snap(points)
+    assert np.all(snapped.inside)
+    assert np.all(snapped.module == 2)
+    assert np.all(snapped.layer == 10)
+    assert np.all(snapped.x == 3)
+    assert np.all(snapped.y == -7)
 
 
 @pytest.mark.parametrize(
@@ -109,9 +85,8 @@ def test_points_inside_a_cell_snap_to_it(geometry):
         ((2000.0, 0.0, 2400.0), SnapStatus.BEYOND_HALF_LENGTH),
         # Between two staves (phi = 45 deg), outside the silicon of both.
         ((2120.0 * np.cos(np.pi / 4), 2120.0 * np.sin(np.pi / 4), 0.0), SnapStatus.BEYOND_STAVE_EDGE),
-        ((np.nan, 0.0, 0.0), SnapStatus.NON_FINITE),
         ((2000.0, 0.0, 0.0), SnapStatus.INSIDE),
     ],
 )
-def test_snap_status(geometry, position, status):
-    assert geometry.snap([position]).status[0] == status
+def test_snap_status(position, status):
+    assert snap([position]).status[0] == status

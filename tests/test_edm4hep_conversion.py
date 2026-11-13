@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from BIBgen.ecal_geometry import ECalBarrelGeometry
+from BIBgen.ecal_geometry import cell_center
 from BIBgen.edm4hep_conversion import (
     CUT_REASONS,
     cylindrical_to_cartesian,
@@ -11,19 +11,14 @@ from BIBgen.edm4hep_conversion import (
 )
 
 
-@pytest.fixture(scope="module")
-def geometry():
-    return ECalBarrelGeometry.from_json()
-
-
 def test_cylindrical_to_cartesian():
     p = cylindrical_to_cartesian([0.0, np.pi / 2], [2000.0, 1900.0], [10.0, -5.0])
     np.testing.assert_allclose(p, [[2000.0, 0.0, 10.0], [0.0, 1900.0, -5.0]], atol=1e-9)
 
 
-def test_prepare_event_cuts_merges_and_counts(geometry):
-    center = geometry.cell_center(0, 3, 10, -20)
-    other = geometry.cell_center(4, 30, -50, 100)
+def test_prepare_event_cuts_merges_and_counts():
+    center = cell_center(0, 3, 10, -20)
+    other = cell_center(4, 30, -50, 100)
     shift = np.array([0.0, 1.0, 1.0])
     energies = [1e-4, 2e-4, -5e-5, 3e-4, 1e-4, np.nan]
     positions = [
@@ -34,7 +29,7 @@ def test_prepare_event_cuts_merges_and_counts(geometry):
         [1800.0, 0.0, 0.0],           # cut: below the first layer
         center,                       # cut: non-finite energy
     ]
-    event = prepare_event(energies, positions, geometry)
+    event = prepare_event(energies, positions)
     c = event.counts
 
     assert c["n_input"] == 6
@@ -61,14 +56,14 @@ def test_prepare_event_cuts_merges_and_counts(geometry):
     np.testing.assert_array_equal(event.contribution_times, 0.0)
 
 
-def test_prepare_event_uses_given_times(geometry):
-    p = geometry.cell_center([0, 1], [0, 0], [0, 0], [0, 0])
-    event = prepare_event([1e-4, 2e-4], p, geometry, times=[3.5, 7.25])
+def test_prepare_event_uses_given_times():
+    p = cell_center([0, 1], [0, 0], [0, 0], [0, 0])
+    event = prepare_event([1e-4, 2e-4], p, times=[3.5, 7.25])
     assert sorted(event.contribution_times.tolist()) == [3.5, 7.25]
 
 
-def test_prepare_event_all_cut(geometry):
-    event = prepare_event([-1.0, -2.0], [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], geometry)
+def test_prepare_event_all_cut():
+    event = prepare_event([-1.0, -2.0], [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]])
     assert event.counts["n_contributions"] == 0
     assert len(event.cell_ids) == 0
     assert event.counts["snap_distance_max"] == 0.0

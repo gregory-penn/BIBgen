@@ -24,7 +24,15 @@ from pathlib import Path
 import numpy as np
 import numpy.typing as npt
 
-from BIBgen.ecal_geometry import ECalBarrelGeometry, SnapStatus
+from BIBgen.ecal_geometry import (
+    CELL_ID_ENCODING,
+    COLLECTION,
+    SnapStatus,
+    cell_center,
+    decode_cell_id,
+    encode_cell_id,
+    snap,
+)
 
 FloatArray = npt.NDArray[np.float64]
 IntArray = npt.NDArray[np.int64]
@@ -52,7 +60,8 @@ MC_PARTICLE_COLLECTION = "MCParticles"
 EVENT_HEADER_COLLECTION = "EventHeader"
 CONTRIBUTION_SUFFIX = "Contributions"
 
-# Reasons a generated hit is cut, in the order they are applied.
+# Reasons a generated hit is cut, in the order they are applied. The last four are
+# the names of the ``SnapStatus`` values in lower case.
 CUT_REASONS = (
     "non_finite",
     "non_positive_energy",
@@ -61,12 +70,6 @@ CUT_REASONS = (
     "beyond_half_length",
     "beyond_stave_edge",
 )
-_STATUS_TO_REASON = {
-    SnapStatus.BELOW_FIRST_LAYER: "below_first_layer",
-    SnapStatus.BEYOND_LAST_LAYER: "beyond_last_layer",
-    SnapStatus.BEYOND_HALF_LENGTH: "beyond_half_length",
-    SnapStatus.BEYOND_STAVE_EDGE: "beyond_stave_edge",
-}
 
 
 @dataclass
@@ -111,7 +114,6 @@ def cylindrical_to_cartesian(phi: npt.ArrayLike, s: npt.ArrayLike, z: npt.ArrayL
 def prepare_event(
     energies: npt.ArrayLike,
     positions: npt.ArrayLike,
-    geometry: ECalBarrelGeometry,
     times: npt.ArrayLike | None = None,
 ) -> ConvertedEvent:
     """Cut, snap and group one event's generated hits.
@@ -122,8 +124,6 @@ def prepare_event(
         Hit energies in GeV.
     positions : array_like, shape (n, 3)
         Global (x, y, z) in mm.
-    geometry : ECalBarrelGeometry
-        Cell geometry used for snapping.
     times : array_like, shape (n,), optional
         Hit times in ns. If omitted, every time is 0.
 
@@ -143,13 +143,7 @@ def prepare_event(
     e = np.asarray(energies, dtype=np.float64).reshape(-1)
     p = np.asarray(positions, dtype=np.float64).reshape(-1, 3)
     n = len(e)
-    if len(p) != n:
-        msg = f"{n} energies but {len(p)} positions"
-        raise ValueError(msg)
     t = np.zeros(n) if times is None else np.asarray(times, dtype=np.float64).reshape(-1)
-    if len(t) != n:
-        msg = f"{n} energies but {len(t)} times"
-        raise ValueError(msg)
 
     counts: dict[str, float] = {"n_input": float(n)}
     reason = np.full(n, "", dtype=object)
@@ -160,10 +154,9 @@ def prepare_event(
     reason[nonpositive] = "non_positive_energy"
 
     candidate = finite & ~nonpositive
-    snap = geometry.snap(p[candidate])
-    snap_reason = np.full(len(snap.status), "", dtype=object)
-    for status, name in _STATUS_TO_REASON.items():
-        snap_reason[snap.status == status] = name
+    snapped = snap(p[candidate])
+    snap_reason = np.full(len(snapped.status), "", dtype=object)
+    snap_reason[~snapped.inside] = [SnapStatus(s).name.lower() for s in snapped.status[~snapped.inside]]
     reason[candidate] = snap_reason
 
     for name in CUT_REASONS:
@@ -171,15 +164,12 @@ def prepare_event(
         counts[f"n_cut_{name}"] = float(mask.sum())
         counts[f"energy_cut_{name}"] = float(np.nansum(e[mask]))
 
-    keep_in_candidate = snap.inside
+    inside = snapped.inside
     keep = np.zeros(n, dtype=bool)
-    keep[candidate] = keep_in_candidate
+    keep[candidate] = inside
 
-    cell_ids_all = geometry.encode_cell_id(
-        snap.module[keep_in_candidate],
-        snap.layer[keep_in_candidate],
-        snap.x[keep_in_candidate],
-        snap.y[keep_in_candidate],
+    cell_ids_all = encode_cell_id(
+        snapped.module[inside], snapped.layer[inside], snapped.x[inside], snapped.y[inside]
     )
     cell_ids, contribution_cell = np.unique(cell_ids_all, return_inverse=True)
     contribution_cell = contribution_cell.reshape(-1).astype(np.int64)
@@ -190,13 +180,13 @@ def prepare_event(
     kept_e = e[keep][order]
     kept_t = t[keep][order]
     kept_p = p[keep][order]
+    snap_distance = snapped.distance[inside][order]
 
-    fields = geometry.decode_cell_id(cell_ids)
-    cell_positions = geometry.cell_center(fields["module"], fields["layer"], fields["x"], fields["y"])
+    fields = decode_cell_id(cell_ids)
+    cell_positions = cell_center(fields["module"], fields["layer"], fields["x"], fields["y"])
     cell_energies = np.bincount(contribution_cell, weights=kept_e, minlength=len(cell_ids)).astype(np.float64)
 
     per_cell = np.bincount(contribution_cell, minlength=len(cell_ids))
-    snap_distance = np.linalg.norm(kept_p - cell_positions[contribution_cell], axis=1)
     counts["n_contributions"] = float(len(kept_e))
     counts["n_cells"] = float(len(cell_ids))
     counts["n_cells_multiple_contributions"] = float(np.sum(per_cell > 1))
@@ -219,7 +209,6 @@ def prepare_event(
 def write_edm4hep_event(
     path: str | Path,
     event: ConvertedEvent,
-    geometry: ECalBarrelGeometry,
     event_number: int = 0,
     run_number: int = 0,
     placeholders: bool = True,
@@ -235,8 +224,6 @@ def write_edm4hep_event(
         Output ``.edm4hep.root`` file.
     event : ConvertedEvent
         Output of ``prepare_event``.
-    geometry : ECalBarrelGeometry
-        Supplies the collection name and cell-ID encoding.
     event_number, run_number : int
         Stored in the ``EventHeader``.
     placeholders : bool
@@ -285,8 +272,8 @@ def write_edm4hep_event(
         for k in range(begin[j], end[j]):
             h.addToContributions(contribution_handles[k])
 
-    frame.put(hits, geometry.collection)
-    frame.put(contributions, geometry.collection + CONTRIBUTION_SUFFIX)
+    frame.put(hits, COLLECTION)
+    frame.put(contributions, COLLECTION + CONTRIBUTION_SUFFIX)
 
     if placeholders:
         for name in PLACEHOLDER_CALO_COLLECTIONS:
@@ -297,9 +284,7 @@ def write_edm4hep_event(
 
     # The cell-ID encoding is stored as collection metadata, as ddsim does.
     metadata = podio.Frame()
-    metadata.put_parameter(
-        f"{geometry.collection}__{edm4hep.labels.CellIDEncoding}", geometry.cell_id_encoding
-    )
+    metadata.put_parameter(f"{COLLECTION}__{edm4hep.labels.CellIDEncoding}", CELL_ID_ENCODING)
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

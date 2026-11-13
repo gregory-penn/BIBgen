@@ -285,11 +285,11 @@ the BIB overlay (`OverlayTimingRandomMix`) and ECAL digitization (`RealisticCalo
 - The input must be in **physical units** with feature order `(E, phi, s, z)`. Sphered generated
   output must be un-sphered first.
 
-Snapping uses `config/maia_v0_ecal_barrel_geometry.json`, a table of the cell grid of every
-(module, layer) taken from DD4hep by `conversion/extract_ecal_geometry.py`. It reproduces the
-Geant4 cell IDs of all 476,915 ECAL barrel hits in 20 `sim_mp` files.
+Snapping (`src/BIBgen/ecal_geometry.py`) computes the MAIA_v0 ECAL barrel cell grid from the
+constants of the k4geo compact files and assigns each position to the nearest cell center. It
+reproduces the Geant4 cell IDs of all ECAL barrel hits in 20 `sim_mp` files.
 
-All three scripts need the MuColl software image (podio, edm4hep, DD4hep):
+Both scripts need the MuColl software image (podio, edm4hep):
 
 ```bash
 IMG=/cvmfs/unpacked.cern.ch/ghcr.io/muoncollidersoft/mucoll-sim-ubuntu24:v3.1-amd64
@@ -300,7 +300,5 @@ apptainer exec -B /scratch -B /cvmfs -B /ospool $IMG bash -c '
   # raw files keep events in a group, one dataset per event
   python examples/conversion/convert_hdf5_to_edm4hep.py -i raw.hdf5 --group test --dataset tau0 -o edm4hep_out
   # validate on a real ddsim file: round trip of its ECAL barrel hits through the converter
-  python examples/conversion/validate_conversion.py -i BIB_sim_1000.edm4hep.root
-  # regenerate the geometry table (only needed if the detector geometry changes)
-  python examples/conversion/extract_ecal_geometry.py'
+  python examples/conversion/validate_conversion.py -i BIB_sim_1000.edm4hep.root'
 ```

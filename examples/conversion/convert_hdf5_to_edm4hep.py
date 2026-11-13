@@ -34,7 +34,6 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from BIBgen.ecal_geometry import DEFAULT_GEOMETRY_TABLE, ECalBarrelGeometry
 from BIBgen.edm4hep_conversion import (
     CUT_REASONS,
     cylindrical_to_cartesian,
@@ -97,7 +96,6 @@ def print_totals(total):
 
 
 def main(args):
-    geometry = ECalBarrelGeometry.from_json(args.geometry)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -122,13 +120,12 @@ def main(args):
                 return 1
             positions = cylindrical_to_cartesian(data[:, COL_PHI], data[:, COL_S], data[:, COL_Z])
             times = data[:, args.time_column] if args.time_column is not None else None
-            event = prepare_event(data[:, COL_E], positions, geometry, times=times)
+            event = prepare_event(data[:, COL_E], positions, times=times)
 
             path = out_dir / f"{args.prefix}_{event_number}.edm4hep.root"
             write_edm4hep_event(
                 path,
                 event,
-                geometry,
                 event_number=event_number,
                 run_number=args.run_number,
                 placeholders=not args.no_placeholders,
@@ -157,8 +154,6 @@ if __name__ == "__main__":
     parser = ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("-i", "--input", required=True, help="Input HDF5 file")
     parser.add_argument("-o", "--output-dir", required=True, help="Directory for the .edm4hep.root files")
-    parser.add_argument("-g", "--geometry", default=str(DEFAULT_GEOMETRY_TABLE),
-                        help="ECAL barrel geometry table (default: %(default)s)")
     parser.add_argument("--group", default=None,
                         help="HDF5 group holding the evt_N entries (default: top level)")
     parser.add_argument("--dataset", default=None,

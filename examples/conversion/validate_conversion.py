@@ -31,7 +31,16 @@ import h5py
 import numpy as np
 from podio.root_io import Reader
 
-from BIBgen.ecal_geometry import DEFAULT_GEOMETRY_TABLE, ECalBarrelGeometry, SnapStatus
+from BIBgen.ecal_geometry import (
+    CELL_SIZE,
+    COLLECTION,
+    LAYER_THICKNESS,
+    SnapStatus,
+    decode_cell_id,
+    encode_cell_id,
+    module_axes,
+    snap,
+)
 from BIBgen.edm4hep_conversion import CONTRIBUTION_SUFFIX, CUT_REASONS
 
 CONVERTER = Path(__file__).resolve().parent / "convert_hdf5_to_edm4hep.py"
@@ -116,42 +125,36 @@ def check(name, ok, detail=""):
     return bool(ok)
 
 
-def jitter_test(geometry, real, rng):
+def jitter_test(real, rng):
     """Move each real hit inside its cell and check it snaps back to the same cell."""
-    fields = geometry.decode_cell_id(real["cell_id"])
-    m = np.searchsorted(geometry.modules, fields["module"])
-    lay = np.searchsorted(geometry.layers, fields["layer"])
-    n = len(m)
-    # Offsets in the cell's own frame, strictly inside the cell (99% of the half-size).
-    du = rng.uniform(-0.495, 0.495, n) * geometry.cell_size_x
-    dv = rng.uniform(-0.495, 0.495, n) * geometry.cell_size_y
-    pitch = np.diff(geometry.layer_depth, axis=1).min()
-    dn = rng.uniform(-0.495, 0.495, n) * pitch
-    jittered = (
-        real["position"]
-        + du[:, None] * geometry.axis_x[m, lay]
-        + dv[:, None] * geometry.axis_y[m, lay]
-        + dn[:, None] * geometry.normal[m, lay]
-    )
-    snap = geometry.snap(jittered)
-    back = geometry.encode_cell_id(snap.module, snap.layer, snap.x, snap.y)
-    same = (back == real["cell_id"]) & snap.inside
+    fields = decode_cell_id(real["cell_id"])
+    normal, axis_x = module_axes(fields["module"])
+    n = len(normal)
+    # Offsets strictly inside the cell (99% of the half-size): across the module,
+    # along z, and along the normal (up to nearly half a layer).
+    d_across = rng.uniform(-0.495, 0.495, n) * CELL_SIZE
+    d_z = rng.uniform(-0.495, 0.495, n) * CELL_SIZE
+    d_normal = rng.uniform(-0.495, 0.495, n) * LAYER_THICKNESS
+    jittered = real["position"] + d_across[:, None] * axis_x + d_normal[:, None] * normal
+    jittered[:, 2] += d_z
+    snapped = snap(jittered)
+    back = encode_cell_id(snapped.module, snapped.layer, snapped.x, snapped.y)
+    same = (back == real["cell_id"]) & snapped.inside
     print(f"Jitter test: {same.sum()} of {n} jittered hits snap back to their own cell"
           f" ({100 * same.mean():.4f}%)")
     if (~same).any():
-        statuses = {SnapStatus(s).name: int(c) for s, c in zip(*np.unique(snap.status[~same], return_counts=True), strict=True)}
+        statuses = {SnapStatus(s).name: int(c) for s, c in zip(*np.unique(snapped.status[~same], return_counts=True), strict=True)}
         print("  statuses of the others:", statuses)
         print("  their x indices:", fields["x"][~same][:20])
     return same.mean()
 
 
 def main(args):
-    geometry = ECalBarrelGeometry.from_json(args.geometry)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("Reading", args.input)
-    real = read_ecal_barrel(args.input, geometry.collection)
+    real = read_ecal_barrel(args.input, COLLECTION)
     n = len(real["energy"])
     print(f"{n} ECAL barrel hits, {real['n_contrib'].sum()} contributions")
 
@@ -166,7 +169,7 @@ def main(args):
     convert_dir = out_dir / "converted"
     command = [
         sys.executable, str(CONVERTER), "-i", str(h5_path), "-o", str(convert_dir),
-        "-g", str(args.geometry), "--time-column", "4", "--prefix", "BIB_validate",
+        "--time-column", "4", "--prefix", "BIB_validate",
     ]
     print("Running:", " ".join(command))
     result = subprocess.run(command, check=False, capture_output=True, text=True)
@@ -177,7 +180,7 @@ def main(args):
         return 1
 
     converted_path = convert_dir / f"BIB_validate_{args.event_number}.edm4hep.root"
-    conv = read_converted(converted_path, geometry.collection)
+    conv = read_converted(converted_path, COLLECTION)
 
     ok = True
     order_real = np.argsort(real["cell_id"])
@@ -220,7 +223,7 @@ def main(args):
     n_cut = sum(float(counts[f"n_cut_{r}"]) for r in CUT_REASONS)
     ok &= check("no hits cut", n_cut == 0, f"{int(n_cut)} cut")
 
-    jitter_fraction = jitter_test(geometry, real, np.random.default_rng(args.seed))
+    jitter_fraction = jitter_test(real, np.random.default_rng(args.seed))
 
     print("\nRound-trip validation", "PASSED" if ok else "FAILED")
     print(f"Jitter test: {100 * jitter_fraction:.4f}% snap back (informational)")
@@ -235,8 +238,6 @@ if __name__ == "__main__":
     parser.add_argument("-i", "--input", required=True, help="Real ddsim EDM4hep BIB file")
     parser.add_argument("-o", "--output-dir", default="private/output/conversion_validation",
                         help="Directory for the intermediate HDF5 and converted file (default: %(default)s)")
-    parser.add_argument("-g", "--geometry", default=str(DEFAULT_GEOMETRY_TABLE),
-                        help="ECAL barrel geometry table (default: %(default)s)")
     parser.add_argument("--event-number", type=int, default=0, help="Event number used for the test")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for the jitter test")
     print("\nFinished with exit code:", main(parser.parse_args()))
