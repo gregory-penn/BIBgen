@@ -31,17 +31,13 @@ Within one module the centers form a rectangular grid, so the nearest center is
 found by rounding each of the three coordinates (depth, across, along z) to the
 nearest grid value separately.
 
-The module is the one whose 30 deg sector contains the position's azimuth, except
-in the crack window: within ``CRACK_HALF_WIDTH`` of a sector boundary. There the
-outermost cells of the module across the boundary may be nearer. Their centers lie
-up to half a cell beyond the end of the silicon (the outermost cells are only
-partly silicon), which in some layers is past the boundary. Inside the window both
-modules are tried and the nearer valid cell center wins. Outside it, only one
-module can be nearest. ``crack_reach`` computes how far past a boundary a module's
+When the hit is near the boundary between two modules, the snapping is modified
+to follow GEANT's behavior. GEANT assigns the hits to an index corresponding to 
+the center of a cube. These cubes can overlap between modules, so special handling
+is required to treat which hits belong to which cubes in his scenario. 
+``crack_reach`` computes how far past a boundary a module's
 cells can be nearest; ``CRACK_HALF_WIDTH`` is that distance rounded up.
 
-The silicon itself never crosses a sector boundary. The crack window exists only
-because of where ddsim places the outermost cells' centers.
 """
 from __future__ import annotations
 
