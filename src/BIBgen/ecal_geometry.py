@@ -23,17 +23,30 @@ module's center line at z = 0.
 
 Snapping rule
 -------------
-A position is assigned to the nearest cell center. Within one module the centers
-form a rectangular grid, so the nearest center is found by rounding each of the
-three coordinates (depth, across, along z) to the nearest grid value separately.
-Neighboring modules overlap at their edges, so the two neighbors of the nearest
-module are also tried, and the closest cell center among the three modules wins.
+A position is assigned to the cell whose center is nearest, where "center" is the
+position ddsim writes for a hit in that cell. This reproduces the Geant4 cell IDs
+of real hits from their stored positions.
+
+Within one module the centers form a rectangular grid, so the nearest center is
+found by rounding each of the three coordinates (depth, across, along z) to the
+nearest grid value separately.
+
+The module is the one whose 30 deg sector contains the position's azimuth, except
+in the crack window: within ``CRACK_HALF_WIDTH`` of a sector boundary. There the
+outermost cells of the module across the boundary may be nearer. Their centers lie
+up to half a cell beyond the end of the silicon (the outermost cells are only
+partly silicon), which in some layers is past the boundary. Inside the window both
+modules are tried and the nearer valid cell center wins. Outside it, only one
+module can be nearest. ``crack_reach`` computes how far past a boundary a module's
+cells can be nearest; ``CRACK_HALF_WIDTH`` is that distance rounded up.
+
+The silicon itself never crosses a sector boundary. The crack window exists only
+because of where ddsim places the outermost cells' centers.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import IntEnum
-from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -61,6 +74,10 @@ CELL_SIZE = 5.1  # mm, in both x and y
 
 # Largest |y| cell index: cells whose centers lie within half a cell of the silicon end.
 MAX_Y_INDEX = int(np.floor(HALF_LENGTH / CELL_SIZE + 0.5))  # 452
+
+# mm, half-width of the crack window around each sector boundary. It must be at least
+# crack_reach() (4.92 mm); tests check this.
+CRACK_HALF_WIDTH = 5.0
 
 
 class SnapStatus(IntEnum):
@@ -187,32 +204,55 @@ def snap(positions: npt.ArrayLike) -> SnapResult:
     The positions must be finite. See the module docstring for the rule.
     """
     p = np.asarray(positions, dtype=np.float64).reshape(-1, 3)
-    n = len(p)
 
-    # The module whose normal points closest to the position's azimuth, then its two neighbors.
-    azimuth = np.arctan2(p[:, 1], p[:, 0])
-    nearest = np.round(-azimuth / MODULE_ANGLE).astype(np.int64) % N_MODULES
-    trials = [_snap_in_module(p, (nearest + step) % N_MODULES) for step in (0, -1, 1)]
+    # Sector module: module m faces azimuth -m * 30 deg, so -azimuth / 30 deg rounded
+    # to a whole number is the module whose sector contains the position.
+    steps = -np.arctan2(p[:, 1], p[:, 0]) / MODULE_ANGLE
+    sector = np.round(steps)
+    module = sector.astype(np.int64) % N_MODULES
+    result = _snap_in_module(p, module)
 
-    # Keep the closest cell center among the modules where the position is inside.
-    # If it is inside none of them, argmin returns 0, so the nearest module's
-    # status is reported.
-    distance = np.stack([np.where(t.inside, t.distance, np.inf) for t in trials])
-    pick = np.argmin(distance, axis=0)
-    rows = np.arange(n)
+    # Crack window. `offset` is the position's azimuth relative to its module's normal,
+    # in units of 30 deg: -0.5 and +0.5 are the two sector boundaries.
+    offset = steps - sector
+    radius = np.hypot(p[:, 0], p[:, 1])
+    distance_to_boundary = radius * np.sin((0.5 - np.abs(offset)) * MODULE_ANGLE)
+    in_crack = np.flatnonzero(distance_to_boundary < CRACK_HALF_WIDTH)
+    if len(in_crack) == 0:
+        return result
 
-    def choose(name: str) -> npt.NDArray[Any]:
-        chosen: npt.NDArray[Any] = np.stack([getattr(t, name) for t in trials])[pick, rows]
-        return chosen
+    # The neighbor across the nearer boundary: the next module when offset > 0.
+    neighbor = (module[in_crack] + np.where(offset[in_crack] > 0, 1, -1)) % N_MODULES
+    other = _snap_in_module(p[in_crack], neighbor)
+    current_ok = result.inside[in_crack]
+    use_other = other.inside & (~current_ok | (other.distance < result.distance[in_crack]))
 
-    return SnapResult(
-        module=choose("module"),
-        layer=choose("layer"),
-        x=choose("x"),
-        y=choose("y"),
-        status=choose("status"),
-        distance=choose("distance"),
-    )
+    values = {f.name: getattr(result, f.name).copy() for f in fields(SnapResult)}
+    for name, array in values.items():
+        array[in_crack[use_other]] = getattr(other, name)[use_other]
+    return SnapResult(**values)
+
+
+def crack_reach() -> float:
+    """Largest distance in mm by which a module's cells can be nearest past its sector boundary.
+
+    The points nearest to a cell's center lie within half a cell across and half a
+    layer in depth of it. This returns how far the corners of those boxes, for the
+    outermost cell of every layer, extend past the sector boundary. By symmetry,
+    module 0 and its boundary at +15 deg cover every module and boundary.
+    """
+    normal, axis_x = module_axes(0)
+    boundary = MODULE_ANGLE / 2
+    # Unit vector perpendicular to the boundary, pointing out of module 0's sector.
+    outward = np.array([-np.sin(boundary), np.cos(boundary), 0.0])
+    layers = np.arange(N_LAYERS)
+    centers = cell_center(0, layers, max_x_index(layers), 0)
+    reach = -np.inf
+    for across in (-0.5, 0.5):
+        for depth in (-0.5, 0.5):
+            corner = centers + across * CELL_SIZE * axis_x + depth * LAYER_THICKNESS * normal
+            reach = max(reach, float(np.max(corner @ outward)))
+    return reach
 
 
 def encode_cell_id(

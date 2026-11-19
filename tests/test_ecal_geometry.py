@@ -5,9 +5,14 @@ import pytest
 
 from BIBgen.ecal_geometry import (
     CELL_SIZE,
+    CRACK_HALF_WIDTH,
     LAYER_THICKNESS,
+    MODULE_ANGLE,
+    N_MODULES,
     SnapStatus,
+    _snap_in_module,
     cell_center,
+    crack_reach,
     decode_cell_id,
     encode_cell_id,
     module_axes,
@@ -90,3 +95,30 @@ def test_points_inside_a_cell_snap_to_it():
 )
 def test_snap_status(position, status):
     assert snap([position]).status[0] == status
+
+
+def test_crack_window_covers_the_reach():
+    assert crack_reach() == pytest.approx(4.92, abs=0.01)
+    assert crack_reach() <= CRACK_HALF_WIDTH
+
+
+def test_crack_window_matches_trying_all_neighbors():
+    # Points within 8 mm of a sector boundary, over the full depth and length.
+    rng = np.random.default_rng(1)
+    n = 200_000
+    radius = rng.uniform(1850, 2130, n)
+    boundary = np.radians(15 + 30 * rng.integers(0, 12, n))
+    azimuth = boundary + rng.uniform(-8, 8, n) / radius
+    p = np.stack([radius * np.cos(azimuth), radius * np.sin(azimuth), rng.uniform(-2300, 2300, n)], axis=1)
+
+    # Reference: try the sector module and both its neighbors; keep the nearest valid cell.
+    sector = np.round(-azimuth / MODULE_ANGLE).astype(np.int64) % N_MODULES
+    trials = [_snap_in_module(p, (sector + step) % N_MODULES) for step in (0, -1, 1)]
+    distance = np.stack([np.where(t.inside, t.distance, np.inf) for t in trials])
+    pick = np.argmin(distance, axis=0)
+    rows = np.arange(n)
+
+    result = snap(p)
+    for name in ("module", "layer", "x", "y", "status"):
+        expected = np.stack([getattr(t, name) for t in trials])[pick, rows]
+        np.testing.assert_array_equal(getattr(result, name), expected, err_msg=name)
