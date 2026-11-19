@@ -107,27 +107,27 @@ class SnapResult:
         return inside
 
 
-def module_axes(module: npt.ArrayLike) -> tuple[FloatArray, FloatArray]:
-    """Return the unit vectors ``(normal, axis_x)`` of each module, each of shape (..., 3).
+def module_axes(module: IntArray) -> tuple[FloatArray, FloatArray]:
+    """Return the unit vectors ``(normal, axis_x)`` for module numbers (n,), each of shape (n, 3).
 
     ``normal`` points away from the beam axis and ``axis_x`` across the module, in
     the direction of increasing x cell index. The y cell index increases along z.
     """
-    a = -np.asarray(module, dtype=np.float64) * MODULE_ANGLE
+    a = -module * MODULE_ANGLE
     zero = np.zeros_like(a)
-    normal = np.stack([np.cos(a), np.sin(a), zero], axis=-1)
-    axis_x = np.stack([-np.sin(a), np.cos(a), zero], axis=-1)
+    normal = np.stack([np.cos(a), np.sin(a), zero], axis=1)
+    axis_x = np.stack([-np.sin(a), np.cos(a), zero], axis=1)
     return normal, axis_x
 
 
-def silicon_depth(layer: npt.ArrayLike) -> FloatArray:
-    """Distance in mm of the middle of each layer's silicon from the beam axis (along the normal)."""
-    depth: FloatArray = INNER_RADIUS + np.asarray(layer, dtype=np.float64) * LAYER_THICKNESS + SILICON_OFFSET
+def silicon_depth(layer: IntArray) -> FloatArray:
+    """Distance in mm of the middle of the silicon of layers (n,) from the beam axis (along the normal)."""
+    depth: FloatArray = INNER_RADIUS + layer * LAYER_THICKNESS + SILICON_OFFSET
     return depth
 
 
-def max_x_index(layer: npt.ArrayLike) -> IntArray:
-    """Largest |x| cell index in each layer.
+def max_x_index(layer: IntArray) -> IntArray:
+    """Largest |x| cell index for layers (n,).
 
     A module's cross-section is a trapezoid whose sides make 15 deg (half of 30 deg)
     with the normal, so the silicon's half-width is (distance of the layer's inner
@@ -135,26 +135,19 @@ def max_x_index(layer: npt.ArrayLike) -> IntArray:
     (their centers lie up to half a cell outside it); Geant4 records hits in them,
     so they count as valid.
     """
-    inner_face = INNER_RADIUS + np.asarray(layer, dtype=np.float64) * LAYER_THICKNESS
+    inner_face = INNER_RADIUS + layer * LAYER_THICKNESS
     half_width = inner_face * np.tan(MODULE_ANGLE / 2)
     index: IntArray = np.floor(half_width / CELL_SIZE + 0.5).astype(np.int64)
     return index
 
 
-def cell_center(
-    module: npt.ArrayLike, layer: npt.ArrayLike, x: npt.ArrayLike, y: npt.ArrayLike
-) -> FloatArray:
-    """Global (x, y, z) in mm of the center of each given cell.
-
-    The result has the shape of the inputs plus a trailing axis of length 3:
-    (n, 3) for arrays of length n, (3,) for scalars.
-    """
+def cell_center(module: IntArray, layer: IntArray, x: IntArray, y: IntArray) -> FloatArray:
+    """Global (x, y, z) in mm of the centers of cells given by four index arrays (n,); shape (n, 3)."""
     normal, axis_x = module_axes(module)
-    depth = silicon_depth(layer)[..., None]
-    across = (np.asarray(x, dtype=np.float64) * CELL_SIZE)[..., None]
-    along_z = np.asarray(y, dtype=np.float64) * CELL_SIZE
+    depth = silicon_depth(layer)[:, None]
+    across = (x * CELL_SIZE)[:, None]
     center: FloatArray = depth * normal + across * axis_x
-    center[..., 2] = along_z
+    center[:, 2] = y * CELL_SIZE
     return center
 
 
@@ -166,7 +159,7 @@ def _snap_in_module(p: FloatArray, module: IntArray) -> SnapResult:
     along_z = p[:, 2]
 
     # Nearest silicon plane, nearest cell across the module, nearest cell along z.
-    layer = np.floor((depth - silicon_depth(0)) / LAYER_THICKNESS + 0.5).astype(np.int64)
+    layer = np.floor((depth - (INNER_RADIUS + SILICON_OFFSET)) / LAYER_THICKNESS + 0.5).astype(np.int64)
     x = np.floor(across / CELL_SIZE + 0.5).astype(np.int64)
     y = np.floor(along_z / CELL_SIZE + 0.5).astype(np.int64)
 
@@ -194,12 +187,11 @@ def _snap_in_module(p: FloatArray, module: IntArray) -> SnapResult:
     return SnapResult(module=module, layer=layer_clipped, x=x, y=y, status=status, distance=distance)
 
 
-def snap(positions: npt.ArrayLike) -> SnapResult:
+def snap(p: FloatArray) -> SnapResult:
     """Assign each global position (n, 3), in mm, to the nearest ECAL barrel cell center.
 
     The positions must be finite. See the module docstring for the rule.
     """
-    p = np.asarray(positions, dtype=np.float64).reshape(-1, 3)
 
     # Sector module: module m faces azimuth -m * 30 deg, so -azimuth / 30 deg rounded
     # to a whole number is the module whose sector contains the position.
@@ -237,12 +229,13 @@ def crack_reach() -> float:
     outermost cell of every layer, extend past the sector boundary. By symmetry,
     module 0 and its boundary at +15 deg cover every module and boundary.
     """
-    normal, axis_x = module_axes(0)
+    layers = np.arange(N_LAYERS)
+    module = np.zeros(N_LAYERS, dtype=np.int64)
+    normal, axis_x = module_axes(module)
     boundary = MODULE_ANGLE / 2
     # Unit vector perpendicular to the boundary, pointing out of module 0's sector.
     outward = np.array([-np.sin(boundary), np.cos(boundary), 0.0])
-    layers = np.arange(N_LAYERS)
-    centers = cell_center(0, layers, max_x_index(layers), 0)
+    centers = cell_center(module, layers, max_x_index(layers), np.zeros(N_LAYERS, dtype=np.int64))
     reach = -np.inf
     for across in (-0.5, 0.5):
         for depth in (-0.5, 0.5):
@@ -251,18 +244,16 @@ def crack_reach() -> float:
     return reach
 
 
-def encode_cell_id(
-    module: npt.ArrayLike, layer: npt.ArrayLike, x: npt.ArrayLike, y: npt.ArrayLike
-) -> UIntArray:
+def encode_cell_id(module: IntArray, layer: IntArray, x: IntArray, y: IntArray) -> UIntArray:
     """Pack cell indices into 64-bit cell IDs following ``CELL_ID_ENCODING``.
 
     Bits 0-4 system, 7-14 module, 19-27 layer, 32-47 x and 48-63 y (both as 16-bit
     two's complement). The side, stave and submodule bits stay 0.
     """
 
-    def bits(v: npt.ArrayLike) -> UIntArray:
+    def bits(v: IntArray) -> UIntArray:
         # int64 -> uint64 keeps the two's-complement bit pattern of negative values.
-        return np.asarray(v, dtype=np.int64).astype(np.uint64)
+        return v.astype(np.uint64)
 
     low16 = np.uint64(0xFFFF)
     cell_id: UIntArray = (
@@ -275,9 +266,8 @@ def encode_cell_id(
     return cell_id
 
 
-def decode_cell_id(cell_id: npt.ArrayLike) -> dict[str, IntArray]:
-    """Unpack 64-bit cell IDs into ``{"system", "module", "layer", "x", "y"}``."""
-    c = np.asarray(cell_id, dtype=np.uint64)
+def decode_cell_id(c: UIntArray) -> dict[str, IntArray]:
+    """Unpack 64-bit cell IDs (n,) into ``{"system", "module", "layer", "x", "y"}``, each (n,)."""
 
     def field(offset: int, width: int) -> IntArray:
         return ((c >> np.uint64(offset)) & np.uint64((1 << width) - 1)).astype(np.int64)
